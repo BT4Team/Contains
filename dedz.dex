@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+
+import asyncio
+import aiohttp
+import logging
+import os
+import re
+import shutil
+import tempfile
+import traceback
+import base64
+import json
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Dict, Any, List, Callable
+from zipfile import ZipFile, BadZipFile
+from subprocess import check_output, CalledProcessError
+from dataclasses import dataclass
+
+# ========== LOGGING SETUP ==========
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ========== CONFIG ==========
+# Web API configuration
+WEB_API_URL = os.getenv("WEB_API_URL", "https://armpro.site/api")
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 10))  # seconds
+
+# Processing configuration
+TASK_ROOT = Path(os.getenv("TASK_ROOT", tempfile.gettempdir()))
+DCC_DIR = Path(__file__).parent / "ArmPro"
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 50 * 1024 * 1024))  # 50MB
+PROCESSING_TIMEOUT = int(os.getenv("PROCESSING_TIMEOUT", 1800))  # 30 minutes
+
+@dataclass
+class ProtectionType:
+    """Configuration for a protection type"""
+    name: str
+    script: str
+    uses_filter: bool = True
+    extra_args: List[str] = None
+    
+    def __post_init__(self):
+        if self.extra_args is None:
+            self.extra_args = []
+
+# ========== PROTECTION TYPE DEFINITIONS ==========
+# Add or remove protection types here easily
+PROTECTION_TYPES = {
+    'online': ProtectionType(
+        name='online',
+        script='online.py',
+        uses_filter=True,
+        extra_args=[]
+    ),
+    'spro': ProtectionType(
+        name='spro',
+        script='spro.py',
+        uses_filter=True,
+        extra_args=[]
+    ),
+    'supro': ProtectionType(
+        name='supro',
+        script='supro.py',
+        uses_filter=True,
+        extra_args=[]
+    ),
+    'vpnpro': ProtectionType(
+        name='vpnpro',
+        script='vpnpro.py',
+        uses_filter=True,
+        extra_args=[]
+    ),
+    'phplogin': ProtectionType(
+        name='phplogin',
+        script='phplogin.py',
+        uses_filter=True,
+        extra_args=[]
+    ),
+    'dex2c': ProtectionType(
+        name='dex2c',
+        script='dcc.py',
+        uses_filter=True,
+        extra_args=[]
+    ),
+    'dex2c-pro': ProtectionType(
+        name='dex2c-pro',
+        script='dcc-pro.py',
+        uses_filter=True,
+        extra_args=[]
+    ),
+    'dex-v1': ProtectionType(
+        name='dex-v1',
+        script='dex-v1.py',
+        uses_filter=True,
+        extra_args=[]
+    ),
+    'dex-v2': ProtectionType(
+        name='dex-v2',
+        script='dex-v2.py',
+        uses_filter=True,
+        extra_args=['-p']
+    ),
+    'merge': ProtectionType(
+        name='merge',
+        script='merge.py',
+        uses_filter=False,
+        extra_args=[]
+    ),
+    'sign': ProtectionType(
+        name='sign',
+        script='sign.py',
+        uses_filter=False,
+        extra_args=[]
+    ),
+    'optimize': ProtectionType(
+        name='optimize',
+        script='optimize.py',
+        uses_filter=False,
+        extra_args=[]
+    ),
+}
+
+class APKProcessor:
+    def __init__(self):
+        self.session = None
+        self.running = True
+        
+    async def start(self):
+        """Start the processing service"""
+        logger.info("Starting APK Protection Backend Service")
+        self._ensure_ready()
+        
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=60)
+        )
+        
+        try:
+            while self.running:
+                try:
+                    await self.process_pending_jobs()
+                except Exception as e:
+                    logger.error(f"Error processing jobs: {e}")
+                    logger.error(traceback.format_exc())
+                
+                await asyncio.sleep(POLL_INTERVAL)
+                
+        except KeyboardInterrupt:
+            logger.info("Shutting down...")
+        finally:
+            if self.session:
+                await self.session.close()
+    
+    def _ensure_ready(self):
+        """Verify all required components are available"""
+        if not DCC_DIR.exists():
+            raise FileNotFoundError(f"Required directory not found: {DCC_DIR}")
+        
+        # Check if all protection scripts exist
+        missing_scripts = []
+        for protection_type in PROTECTION_TYPES.values():
+            script_path = DCC_DIR / protection_type.script
+            if not script_path.exists():
+                missing_scripts.append(protection_type.script)
+        
+        if missing_scripts:
+            logger.warning(f"Missing protection scripts: {missing_scripts}")
+        
+        try:
+            check_output(["aapt", "version"])
+        except (FileNotFoundError, CalledProcessError):
+            raise RuntimeError("aapt not found. Install it with 'pkg install aapt'.")
+        
+        TASK_ROOT.mkdir(parents=True, exist_ok=True)
+    
+    def _parse_extra_args(self, extra_string: str) -> List[str]:
+        """Parse extra arguments string into a list of arguments"""
+        if not extra_string or not extra_string.strip():
+            return []
+        
+        # Simple argument parsing - split by spaces but respect quoted arguments
+        import shlex
+        try:
+            return shlex.split(extra_string)
+        except ValueError as e:
+            logger.warning(f"Failed to parse extra arguments '{extra_string}': {e}")
+            # Fallback to simple split if shlex fails
+            return extra_string.split()
+    
+    async def process_pending_jobs(self):
+        """Check for and process pending jobs from the web API"""
+        try:
+            # Process jobs for each protection type
+            for protection_name in PROTECTION_TYPES.keys():
+                jobs = await self.get_pending_jobs(protection_name)
+                
+                for job in jobs:
+                    try:
+                        await self.process_job(job, protection_name)
+                    except Exception as e:
+                        logger.error(f"Failed to process {protection_name} job {job['id']}: {e}")
+                        await self.update_job_status(job['id'], protection_name, 'failed', {
+                            'error_message': str(e)
+                        })
+                    
+        except Exception as e:
+            logger.error(f"Error checking pending jobs: {e}")
+    
+    async def get_pending_jobs(self, job_type: str) -> list:
+        """Get pending jobs from the web API"""
+        try:
+            url = f"{WEB_API_URL}/get_pending_jobs.php"
+            params = {'type': job_type}
+            
+            async with self.session.get(url, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get('success'):
+                        return data.get('jobs', [])
+                    else:
+                        logger.error(f"API error: {data.get('error')}")
+                else:
+                    logger.error(f"HTTP error {response.status} when fetching {job_type} jobs")
+                    
+        except Exception as e:
+            logger.error(f"Failed to fetch pending jobs for {job_type}: {e}")
+        
+        return []
+    
+    async def update_job_status(self, job_id: int, job_type: str, status: str, additional_data: dict = None):
+        """Update job status via web API"""
+        try:
+            url = f"{WEB_API_URL}/update_job.php"
+            data = {
+                'job_id': job_id,
+                'type': job_type,
+                'status': status
+            }
+            
+            if additional_data:
+                data.update(additional_data)
+            
+            async with self.session.post(url, json=data) as response:
+                if response.status != 200:
+                    logger.error(f"Failed to update job {job_id} status: HTTP {response.status}")
+                else:
+                    result = await response.json()
+                    if not result.get('success'):
+                        logger.error(f"Failed to update job {job_id}: {result.get('error')}")
+                        
+        except Exception as e:
+            logger.error(f"Failed to update job {job_id} status: {e}")
+    
+    async def process_job(self, job: dict, job_type: str):
+        """Process a single job"""
+        job_id = job['id']
+        logger.info(f"Processing {job_type} job {job_id}: {job['filename']}")
+        
+        # Validate job type
+        if job_type not in PROTECTION_TYPES:
+            raise ValueError(f"Unknown protection type: {job_type}")
+        
+        # Parse extra arguments from job if present
+        job_extra_args = []
+        if 'extra' in job and job['extra']:
+            job_extra_args = self._parse_extra_args(job['extra'])
+            logger.info(f"Job {job_id} has extra arguments: {job_extra_args}")
+        
+        # Update status to downloading
+        await self.update_job_status(job_id, job_type, 'downloading')
+        
+        # Create working directory
+        work_dir = Path(tempfile.mkdtemp(prefix=f"{job_type}_", dir=str(TASK_ROOT)))
+        
+        try:
+            # Decode and save the APK file
+            file_data = base64.b64decode(job['file'])
+            apk_path = work_dir / job['filename']
+            
+            with open(apk_path, 'wb') as f:
+                f.write(file_data)
+            
+            # Validate APK
+            self._validate_apk(apk_path)
+            
+            # Extract app information
+            app_info = self._extract_app_info_with_aapt(apk_path)
+            
+            # Update status with app details
+            await self.update_job_status(job_id, job_type, 'running', {
+                'app_details': app_info
+            })
+            
+            # Process the APK using the appropriate protection type with job extra args
+            output_path = await self._run_protection_process(apk_path, work_dir, job_type, job_extra_args)
+            
+            # Read output file and encode to base64
+            with open(output_path, 'rb') as f:
+                output_data = base64.b64encode(f.read()).decode('utf-8')
+            
+            timestamp = datetime.now().strftime("%d_%H_%M")
+            output_filename = f"ArmPro_{timestamp}_Sign.apk"
+            
+            # Update job as completed
+            await self.update_job_status(job_id, job_type, 'completed', {
+                'output_file': output_data,
+                'output_filename': output_filename
+            })
+            
+            logger.info(f"Successfully processed {job_type} job {job_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to process {job_type} job {job_id}: {e}")
+            logger.error(traceback.format_exc())
+            raise
+        finally:
+            # Cleanup working directory
+            if work_dir.exists():
+                shutil.rmtree(work_dir, ignore_errors=True)
+    
+    def _validate_apk(self, apk_path: Path):
+        """Validate APK file integrity"""
+        try:
+            with ZipFile(apk_path, 'r') as zip_file:
+                zip_file.testzip()
+                file_list = zip_file.namelist()
+                dex_files = [name for name in file_list if name.startswith("classes") and name.endswith(".dex")]
+                if not dex_files:
+                    raise RuntimeError("APK contains no classes.dex files.")
+        except BadZipFile as e:
+            raise RuntimeError(f"Invalid or corrupted APK file: {e}")
+    
+    def _extract_app_info_with_aapt(self, apk_path: Path) -> dict:
+        """Extract app information using aapt"""
+        app_info = {
+            'name': 'Unknown',
+            'package': 'Unknown',
+            'version_name': 'Unknown',
+            'version_code': 'Unknown'
+        }
+        
+        try:
+            output = check_output(["aapt", "dump", "badging", str(apk_path)], text=True)
+            
+            match = re.search(r"package: name='([^']+)'", output)
+            if match:
+                app_info['package'] = match.group(1)
+            
+            match = re.search(r"versionName='([^']+)'", output)
+            if match:
+                app_info['version_name'] = match.group(1)
+            
+            match = re.search(r"versionCode='([^']+)'", output)
+            if match:
+                app_info['version_code'] = match.group(1)
+            
+            match = re.search(r"application-label:'([^']+)'", output)
+            if match:
+                app_info['name'] = match.group(1)
+            
+        except Exception as e:
+            logger.warning(f"Failed to extract app info: {e}")
+        
+        return app_info
+    
+    async def _get_package_name(self, apk_path: Path) -> tuple[str, bool]:
+        """Extract package name from APK file"""
+        try:
+            output = check_output(["aapt", "dump", "badging", str(apk_path)], text=True)
+            match = re.search(r"package: name='([a-zA-Z0-9._]+)'", output)
+            if match:
+                return match.group(1), False
+        except Exception:
+            pass
+        
+        return ".*", True
+    
+    def _build_command(self, protection_type: ProtectionType, dcc_apk: Path, 
+                      dcc_output: Path, dcc_package_txt: Optional[Path] = None, 
+                      job_extra_args: List[str] = None) -> List[str]:
+        """Build command for a protection type"""
+        cmd = [
+            "python3",
+            protection_type.script,
+            "-a", str(dcc_apk.resolve()),
+            "-o", str(dcc_output.resolve()),
+        ]
+        
+        # Add filter if the protection type uses it and filter file is provided
+        if protection_type.uses_filter and dcc_package_txt:
+            cmd.extend(["--filter", str(dcc_package_txt.resolve())])
+        
+        # Add default extra arguments from protection type
+        cmd.extend(protection_type.extra_args)
+        
+        # Add job-specific extra arguments if provided
+        if job_extra_args:
+            cmd.extend(job_extra_args)
+            logger.info(f"Added job extra args to command: {job_extra_args}")
+        
+        return cmd
+    
+    async def _try_protection_with_filter(self, apk_path: Path, pattern: Optional[str], 
+                                        protection_type: ProtectionType, strategy_name: str,
+                                        job_extra_args: List[str] = None) -> Optional[Path]:
+        """Try protection with a specific filter"""
+        timestamp = datetime.now().strftime("%d_%H_%M")
+        dcc_apk = DCC_DIR / f"input_{timestamp}.apk"
+        dcc_package_txt = DCC_DIR / f"package_{timestamp}.txt" if pattern else None
+        dcc_output = DCC_DIR / f"output_{timestamp}.apk"
+        
+        try:
+            # Clean up any existing files
+            cleanup_files = [dcc_apk, dcc_output]
+            if dcc_package_txt:
+                cleanup_files.append(dcc_package_txt)
+            
+            for cleanup_file in cleanup_files:
+                if cleanup_file.exists():
+                    cleanup_file.unlink()
+            
+            # Copy input APK
+            shutil.copy2(apk_path, dcc_apk)
+            
+            # Create package filter file if pattern is provided and protection uses filter
+            if pattern and protection_type.uses_filter and dcc_package_txt:
+                with open(dcc_package_txt, 'w', encoding="utf-8") as f:
+                    f.write(pattern)
+            
+            # Build command using the protection type with job extra args
+            cmd = self._build_command(protection_type, dcc_apk, dcc_output, dcc_package_txt, job_extra_args)
+            
+            logger.info(f"Executing command: {' '.join(cmd)}")
+            
+            # Run protection script
+            process = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    *cmd,
+                    cwd=str(DCC_DIR.resolve()),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=os.environ.copy()
+                ),
+                timeout=30
+            )
+            
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=PROCESSING_TIMEOUT
+            )
+            
+            if process.returncode != 0:
+                stderr_str = stderr.decode('utf-8', errors='ignore') if stderr else ""
+                raise RuntimeError(f"Protection failed with exit code {process.returncode}: {stderr_str}")
+            
+            if not dcc_output.exists() or dcc_output.stat().st_size == 0:
+                raise RuntimeError(f"Output APK file was not created or is empty")
+            
+            # Copy output to final location
+            final_output = DCC_DIR / f"protected_{protection_type.name}_{strategy_name}_{timestamp}.apk"
+            shutil.copy2(dcc_output, final_output)
+            
+            return final_output
+            
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"Process timed out after {PROCESSING_TIMEOUT} seconds")
+        except Exception as e:
+            raise RuntimeError(f"Failed to execute protection: {e}")
+        finally:
+            # Cleanup temporary files
+            cleanup_files = [dcc_apk, dcc_output]
+            if dcc_package_txt:
+                cleanup_files.append(dcc_package_txt)
+                
+            for file_to_remove in cleanup_files:
+                if file_to_remove and file_to_remove.exists():
+                    try:
+                        file_to_remove.unlink()
+                    except Exception:
+                        pass
+    
+    async def _run_protection_process(self, apk_path: Path, work_dir: Path, job_type: str, 
+                                    job_extra_args: List[str] = None) -> Path:
+        """Run the protection process for any protection type"""
+        logger.info(f"Starting {job_type} protection for {apk_path.name}")
+        
+        protection_type = PROTECTION_TYPES[job_type]
+        
+        # Check if script exists
+        script_path = DCC_DIR / protection_type.script
+        if not script_path.exists():
+            raise RuntimeError(f"Protection script not found: {script_path}")
+        
+        # If protection type doesn't use filter, run directly
+        if not protection_type.uses_filter:
+            result = await self._try_protection_with_filter(
+                apk_path, None, protection_type, "direct", job_extra_args
+            )
+            if result and result.exists():
+                return result
+            raise RuntimeError("Direct protection failed")
+        
+        # For filter-based protections, try different strategies
+        package_name, is_fallback = await self._get_package_name(apk_path)
+        
+        # Try specific filter first
+        if not is_fallback and package_name != ".*":
+            specific_filter = package_name.replace(".", "/") + "/.*;.*"
+            
+            try:
+                result = await self._try_protection_with_filter(
+                    apk_path, specific_filter, protection_type, "specific", job_extra_args
+                )
+                if result and result.exists():
+                    return result
+            except Exception as e:
+                logger.warning(f"Specific filter failed: {e}")
+                
+                # Try broad filter
+                if "." in package_name:
+                    parts = package_name.split(".")
+                    if len(parts) >= 2:
+                        broad_package = ".".join(parts[:2])
+                        broad_filter = broad_package.replace(".", "/") + "/.*;.*"
+                        
+                        if broad_filter != specific_filter:
+                            try:
+                                result = await self._try_protection_with_filter(
+                                    apk_path, broad_filter, protection_type, "broad", job_extra_args
+                                )
+                                if result and result.exists():
+                                    return result
+                            except Exception as e:
+                                logger.warning(f"Broad filter failed: {e}")
+        
+        # Try universal filter as last resort
+        universal_filter = ".*;.*"
+        result = await self._try_protection_with_filter(
+            apk_path, universal_filter, protection_type, "universal", job_extra_args
+        )
+        
+        if result and result.exists():
+            return result
+        
+        raise RuntimeError("All filter strategies failed")
+
+async def main():
+    processor = APKProcessor()
+    await processor.start()
+
+if __name__ == "__main__":
+    asyncio.run(main())

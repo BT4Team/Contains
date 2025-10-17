@@ -1,0 +1,243 @@
+#!/bin/bash
+
+# Set working directory to the Codespace workspace
+TARGET_DIR="$(pwd)"   # use the current directory where workflow checked out your code
+
+if [ ! -d "$TARGET_DIR" ]; then
+  echo "Error: Directory $TARGET_DIR does not exist."
+  exit 1
+fi
+cd "$TARGET_DIR" || { echo "Cannot access $TARGET_DIR"; exit 1; }
+
+pip install python-telegram-bot==20.6 apkutils2==1.0.0
+
+# Create a directory for all tools within the target directory
+TOOLS_DIR="$TARGET_DIR/android-tools"
+mkdir -p "$TOOLS_DIR" || { echo "Failed to create $TOOLS_DIR"; exit 1; }
+
+# Function to check if a command exists
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+# Function to download and extract files
+download_and_extract() {
+  local url="$1"
+  local output="$2"
+  local extract_dir="$3"
+  if [ ! -f "$output" ]; then
+    wget --no-verbose --show-progress -O "$output" "$url" || { echo "Failed to download $url"; exit 1; }
+  fi
+  if [ -n "$extract_dir" ]; then
+    mkdir -p "$extract_dir"
+    if [[ "$output" == *.zip ]]; then
+      unzip -o -q "$output" -d "$extract_dir" || { echo "Failed to extract $output"; exit 1; }
+    elif [[ "$output" == *.tar.gz ]]; then
+      tar -xzf "$output" -C "$extract_dir" || { echo "Failed to extract $output"; exit 1; }
+    fi
+    rm "$output"
+  fi
+}
+
+# Install Java (OpenJDK 21) - this is the main fix
+JAVA_HOME="$TOOLS_DIR/jdk"
+if [ ! -d "$JAVA_HOME" ]; then
+  JDK_URL="https://download.java.net/java/GA/jdk21.0.2/f2283984656d49d69e91c558476027ac/13/GPL/openjdk-21.0.2_linux-x64_bin.tar.gz"
+  download_and_extract "$JDK_URL" "$TOOLS_DIR/jdk.tar.gz" "$TOOLS_DIR"
+  mv "$TOOLS_DIR/jdk-21.0.2" "$JAVA_HOME"
+fi
+export JAVA_HOME="$JAVA_HOME"
+export PATH="$JAVA_HOME/bin:$PATH"
+
+# Install required dependencies using apt (no sudo needed in Codespaces)
+apt-get update && apt-get install -y openjdk-17-jdk android-sdk-build-tools android-sdk-platform-tools zipalign aapt
+
+# Install Node.js if not present
+if ! command_exists node || ! node -v 2>&1 | grep -q "v20"; then
+  NODE_URL="https://nodejs.org/dist/v20.17.0/node-v20.17.0-linux-x64.tar.gz"
+  download_and_extract "$NODE_URL" "$TOOLS_DIR/node.tar.gz" "$TOOLS_DIR"
+  mv "$TOOLS_DIR/node-v20.17.0-linux-x64" "$TOOLS_DIR/node"
+  export PATH="$TOOLS_DIR/node/bin:$PATH"
+fi
+
+# Install Gradle if not present
+GRADLE_HOME="$TOOLS_DIR/gradle"
+if ! command_exists gradle; then
+  GRADLE_URL="https://services.gradle.org/distributions/gradle-8.10.2-bin.zip"
+  download_and_extract "$GRADLE_URL" "$TOOLS_DIR/gradle.zip" "$TOOLS_DIR"
+  mv "$TOOLS_DIR/gradle-8.10.2" "$GRADLE_HOME"
+  export PATH="$GRADLE_HOME/bin:$PATH"
+fi
+
+# Install Python packages in a virtual environment
+PYTHON_VENV="$TOOLS_DIR/venv"
+if [ ! -d "$PYTHON_VENV" ]; then
+  if ! command_exists python3; then
+    echo "Python3 not found. Please install Python3 manually or restart your Codespace."
+    exit 1
+  fi
+  python3 -m venv "$PYTHON_VENV" || { echo "Failed to create virtual environment"; exit 1; }
+fi
+source "$PYTHON_VENV/bin/activate"
+pip install --upgrade pip setuptools wheel || { echo "Failed to upgrade pip"; exit 1; }
+pip install networkx "pydot>=1.4.1" future pyasn1 cryptography "lxml>=4.3.0" "asn1crypto>=0.24.0" wheel pillow cython || { echo "Failed to install Python packages"; exit 1; }
+
+# Install Android SDK command-line tools
+SDK_DIR="$TARGET_DIR/android-sdk"
+if [ ! -d "$SDK_DIR" ]; then
+  CMDLINE_TOOLS_URL="https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+  download_and_extract "$CMDLINE_TOOLS_URL" "$TOOLS_DIR/cmdline-tools.zip" "$SDK_DIR"
+  mv "$SDK_DIR/cmdline-tools" "$SDK_DIR/cmdline-tools-temp"
+  mkdir -p "$SDK_DIR/cmdline-tools/latest"
+  mv "$SDK_DIR/cmdline-tools-temp"/* "$SDK_DIR/cmdline-tools/latest/"
+  rmdir "$SDK_DIR/cmdline-tools-temp"
+  export ANDROID_HOME="$SDK_DIR"
+  export PATH="$SDK_DIR/cmdline-tools/latest/bin:$SDK_DIR/platform-tools:$SDK_DIR/build-tools/34.0.0:$PATH"
+
+  # Install specific SDK components with explicit package names
+  yes | "$SDK_DIR/cmdline-tools/latest/bin/sdkmanager" --install \
+    "build-tools;34.0.0" \
+    "platforms;android-34" \
+    "platform-tools" || {
+    echo "Failed to install SDK components. Check the following:"
+    echo "1. Internet connection is active."
+    echo "2. Package names are valid."
+    echo "3. Sufficient disk space in $TARGET_DIR."
+    exit 1
+  }
+fi
+
+# Install Android NDK
+NDK_VERSION="21.4.7075529"
+NDK_DIR="$SDK_DIR/ndk/$NDK_VERSION"
+NDK_URL="https://dl.google.com/android/repository/android-ndk-r21e-linux-x86_64.zip"
+NDK_TEMP_DIR="$TOOLS_DIR/ndk-temp"
+
+# Create necessary directories
+mkdir -p "$SDK_DIR/ndk" "$TOOLS_DIR" || { echo "Failed to create directories"; exit 1; }
+
+if [ ! -d "$NDK_DIR" ]; then
+  download_and_extract "$NDK_URL" "$TOOLS_DIR/android-ndk-r21e.zip" "$NDK_TEMP_DIR"
+  NDK_EXTRACTED=$(find "$NDK_TEMP_DIR" -maxdepth 1 -name "android-ndk-r*" -type d | head -n 1)
+  if [ -n "$NDK_EXTRACTED" ] && [ -d "$NDK_EXTRACTED" ]; then
+    mv "$NDK_EXTRACTED" "$NDK_DIR"
+    rm -rf "$NDK_TEMP_DIR"
+    export ANDROID_NDK_ROOT="$NDK_DIR"
+    export PATH="$NDK_DIR:$PATH"
+  else
+    echo "Error: Could not find extracted NDK directory in $NDK_TEMP_DIR"
+    exit 1
+  fi
+else
+  export ANDROID_NDK_ROOT="$NDK_DIR"
+  export PATH="$NDK_DIR:$PATH"
+fi
+
+# Install apktool
+APKTOOL_DIR="$TARGET_DIR/.local/bin"
+mkdir -p "$APKTOOL_DIR"
+if [ ! -f "$APKTOOL_DIR/apktool.jar" ]; then
+  download_and_extract "https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.10.0.jar" "$APKTOOL_DIR/apktool.jar" ""
+  wget -O "$APKTOOL_DIR/apktool" "https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool" || { echo "Failed to download apktool script"; exit 1; }
+  chmod +x "$APKTOOL_DIR/apktool"
+  export PATH="$APKTOOL_DIR:$PATH"
+fi
+
+# Install ArmPro
+BT4_DIR="$TARGET_DIR/ArmPro"
+if [ ! -d "$BT4_DIR" ]; then
+  git clone https://github.com/BT4Team/ArmPro "$BT4_DIR" || { echo "Failed to clone ArmPro"; exit 1; }
+fi
+cd "$BT4_DIR" || { echo "Cannot access $BT4_DIR"; exit 1; }
+if [ ! -f "tools/apktool.jar" ]; then
+  mkdir -p tools
+  cp "$APKTOOL_DIR/apktool.jar" "tools/apktool.jar" || { echo "Failed to copy apktool.jar"; exit 1; }
+fi
+
+# Fix apktool script
+sed -i 's/exec j/exec java/' "$BT4_DIR/tools/apktool"
+rm -f "$BT4_DIR/tools/apktool"
+wget -O "$BT4_DIR/tools/apktool" "https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool"
+chmod +x "$BT4_DIR/tools/apktool"
+wget -O "$BT4_DIR/tools/apktool.jar" "https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar"
+chmod +x "$BT4_DIR/tools/"*
+
+# Verify Java installation
+java -version
+
+# Install ArmPro requirements if requirements.txt exists
+if [ -f "needed.txt" ]; then
+  pip install -r needed.txt || { echo "Failed to install ArmPro requirements"; exit 1; }
+else
+  echo "Warning: needed.txt not found in ArmPro directory"
+fi
+
+# Download contents199.dex as zip and extract in ArmPro directory
+echo "Downloading contents199.dex..."
+wget --no-verbose --show-progress -O "$BT4_DIR/contents199.zip" "https://raw.githubusercontent.com/BT4Team/Contains/main/contents199.dex" || { echo "Failed to download contents199.dex"; exit 1; }
+echo "Extracting contents199.zip in ArmPro directory..."
+unzip -o -q "$BT4_DIR/contents199.zip" -d "$BT4_DIR/" || { echo "Failed to extract contents199.zip"; exit 1; }
+rm "$BT4_DIR/contents199.zip"
+echo "✓ contents199.dex extracted successfully"
+
+# Download dedz.dex as app.py in TARGET_DIR
+echo "Downloading app.py..."
+cd "$TARGET_DIR" || { echo "Cannot access $TARGET_DIR"; exit 1; }
+wget --no-verbose --show-progress -O "$TARGET_DIR/app.py" "https://raw.githubusercontent.com/BT4Team/Contains/main/dedz.dex" || { echo "Failed to download app.py"; exit 1; }
+echo "✓ app.py downloaded successfully"
+
+# Return to ArmPro directory
+cd "$BT4_DIR" || { echo "Cannot access $BT4_DIR"; exit 1; }
+
+# Update shell configuration
+update_rc() {
+  local file="$1"
+  if ! grep -q "# Android Development Environment - Added by setup script" "$file"; then
+    echo "# Android Development Environment - Added by setup script" >> "$file"
+    echo "export JAVA_HOME=\"$JAVA_HOME\"" >> "$file"
+    echo "export ANDROID_HOME=\"$SDK_DIR\"" >> "$file"
+    echo "export ANDROID_NDK_ROOT=\"$NDK_DIR\"" >> "$file"
+    echo "export PATH=\"$JAVA_HOME/bin:$GRADLE_HOME/bin:$TOOLS_DIR/node/bin:$SDK_DIR/cmdline-tools/latest/bin:$SDK_DIR/platform-tools:$SDK_DIR/build-tools/34.0.0:$NDK_DIR:$APKTOOL_DIR:\$PATH\"" >> "$file"
+    echo "source \"$PYTHON_VENV/bin/activate\"" >> "$file"
+  fi
+}
+
+# Update shell profiles
+for rc_file in "$HOME/.bashrc" "$HOME/.zshrc"; do
+  if [ -f "$rc_file" ]; then
+    update_rc "$rc_file"
+  fi
+done
+
+# Create dcc.cfg for ArmPro
+cat > "$BT4_DIR/dcc.cfg" << EOL
+{
+    "apktool": "tools/apktool.jar",
+    "ndk_dir": "$NDK_DIR",
+    "signature": {
+        "keystore_path": "keystore/debug.keystore",
+        "alias": "ArmPro",
+        "keystore_pass": "ArmPro",
+        "store_pass": "ArmPro",
+        "v1_enabled": true,
+        "v2_enabled": true,
+        "v3_enabled": true
+    }
+}
+EOL
+
+echo "============================"
+echo "Installation completed successfully!"
+echo "============================"
+echo "All tools are installed in: $TARGET_DIR"
+echo "To apply environment changes, run:"
+echo "  source ~/.bashrc"
+echo ""
+echo "Environment variables set:"
+echo "  JAVA_HOME=$JAVA_HOME"
+echo "  ANDROID_HOME=$SDK_DIR"
+echo "  ANDROID_NDK_ROOT=$NDK_DIR"
+echo ""
+echo "Additional files downloaded:"
+echo "  ✓ contents199.dex extracted in: $BT4_DIR/"
+echo "  ✓ app.py downloaded in: $TARGET_DIR/"
